@@ -4,10 +4,11 @@
  * create (if your email is allowed to host) or join a table.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { AVATAR_COUNT } from '@shared/engine';
-import { loadPendingLogin, requestLoginCode, savePendingLogin, verifyLoginCode, type Session } from '../lib/net';
+import { useEmailLogin } from 'oink-kit/react';
+import { authClient, type Session } from '../lib/net';
 import { Avatar, CardBack, Logo, Marker } from './Art';
 import { sfx } from '../lib/sound';
 
@@ -106,89 +107,22 @@ export function Home(props: Props) {
 /* --------------------------------------------------------------- login */
 
 function LoginForm({ onLogin }: { onLogin: (s: Session) => void }) {
-  // Coming back from the mail app may have reloaded the page: resume at the code step.
-  const [resumed] = useState(loadPendingLogin);
-  const [step, setStep] = useState<'email' | 'code'>(resumed ? 'code' : 'email');
-  const [email, setEmail] = useState(resumed?.email ?? '');
-  const [challenge, setChallenge] = useState(resumed?.challenge ?? '');
-  const [code, setCode] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [devCode, setDevCode] = useState<string | null>(null);
-  const [cooldown, setCooldown] = useState(() =>
-    resumed ? Math.max(0, 60 - Math.floor((Date.now() - resumed.at) / 1000)) : 0,
-  );
-  const codeRef = useRef<HTMLInputElement>(null);
-  // Autofill and a quick Enter can both fire; only one verify may be in flight.
-  const verifying = useRef(false);
+  const login = useEmailLogin(authClient, {
+    onLogin: (s) => {
+      sfx.turn();
+      onLogin(s);
+    },
+    onSent: sfx.chip,
+    onError: sfx.error,
+  });
+  const { email, code, busy, error, notice, devCode, cooldown } = login;
 
-  useEffect(() => {
-    if (cooldown <= 0) return;
-    const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
-    return () => clearTimeout(t);
-  }, [cooldown]);
-
-  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim());
-
-  const send = async () => {
-    if (!emailOk || busy) return;
-    setBusy(true);
-    setError(null);
-    const res = await requestLoginCode(email.trim());
-    setBusy(false);
-    if (!res.ok || !res.challenge) {
-      if (res.retryIn) {
-        setCooldown(res.retryIn);
-        // A code for this address is already on its way — go and type it in,
-        // but only if we still hold its challenge; otherwise wait out the cooldown.
-        const pending = loadPendingLogin();
-        if (pending && pending.email === email.trim()) {
-          setChallenge(pending.challenge);
-          setStep('code');
-        }
-      }
-      setError(res.error ?? 'Không gửi được mã');
-      sfx.error();
-      return;
-    }
-    sfx.chip();
-    setChallenge(res.challenge);
-    savePendingLogin({ email: email.trim(), challenge: res.challenge, at: Date.now() });
-    setNotice(res.warning ?? null);
-    setDevCode(res.devCode ?? null);
-    setCooldown(60);
-    setCode('');
-    setStep('code');
-    setTimeout(() => codeRef.current?.focus(), 50);
-  };
-
-  const verify = async (value = code) => {
-    if (value.length !== 6 || verifying.current) return;
-    verifying.current = true;
-    setBusy(true);
-    setError(null);
-    const res = await verifyLoginCode(email.trim(), value, challenge);
-    verifying.current = false;
-    setBusy(false);
-    if (!res.ok || !res.token || !res.user) {
-      setError(res.error ?? 'Mã không đúng');
-      setCode('');
-      sfx.error();
-      codeRef.current?.focus();
-      return;
-    }
-    sfx.turn();
-    savePendingLogin(null);
-    onLogin({ token: res.token, user: res.user });
-  };
-
-  if (step === 'email') {
+  if (login.step === 'email') {
     return (
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          void send();
+          void login.send();
         }}
       >
         <h2 className="display text-lg font-bold">Đăng nhập</h2>
@@ -203,14 +137,14 @@ function LoginForm({ onLogin }: { onLogin: (s: Session) => void }) {
           inputMode="email"
           autoComplete="email"
           value={email}
-          onChange={(e) => setEmail(e.target.value)}
+          onChange={(e) => login.setEmail(e.target.value)}
           placeholder="ban@vidu.com"
           className="field mt-1.5"
           autoFocus
         />
         {error && <p className="mt-2 text-xs font-semibold text-rose">{error}</p>}
 
-        <button type="submit" disabled={!emailOk || busy} className="btn btn-rose mt-4 w-full">
+        <button type="submit" disabled={!login.emailOk || busy} className="btn btn-rose mt-4 w-full">
           {busy ? 'Đang gửi…' : 'Gửi mã đăng nhập'}
         </button>
       </form>
@@ -221,7 +155,7 @@ function LoginForm({ onLogin }: { onLogin: (s: Session) => void }) {
     <form
       onSubmit={(e) => {
         e.preventDefault();
-        void verify();
+        void login.verify();
       }}
     >
       <h2 className="display text-lg font-bold">Nhập mã</h2>
@@ -230,13 +164,9 @@ function LoginForm({ onLogin }: { onLogin: (s: Session) => void }) {
       </p>
 
       <input
-        ref={codeRef}
+        ref={login.codeRef}
         value={code}
-        onChange={(e) => {
-          const v = e.target.value.replace(/\D/g, '').slice(0, 6);
-          setCode(v);
-          if (v.length === 6) void verify(v);
-        }}
+        onChange={(e) => login.typeCode(e.target.value)}
         inputMode="numeric"
         autoComplete="one-time-code"
         placeholder="••••••"
@@ -247,7 +177,7 @@ function LoginForm({ onLogin }: { onLogin: (s: Session) => void }) {
       {devCode && (
         <p className="mt-2 rounded-lg bg-paper px-2.5 py-1.5 text-[11px] text-ink-2">
           Máy chủ chưa cấu hình gửi mail (chế độ dev) — mã là{' '}
-          <button type="button" className="font-bold text-rose underline" onClick={() => void verify(devCode)}>
+          <button type="button" className="font-bold text-rose underline" onClick={() => void login.verify(devCode)}>
             {devCode}
           </button>
         </p>
@@ -262,18 +192,12 @@ function LoginForm({ onLogin }: { onLogin: (s: Session) => void }) {
       <div className="mt-3 flex items-center justify-between text-xs">
         <button
           type="button"
-          onClick={() => {
-            setStep('email');
-            setError(null);
-            setNotice(null);
-            setDevCode(null);
-            savePendingLogin(null);
-          }}
+          onClick={login.changeEmail}
           className="text-ink-2 hover:text-ink"
         >
           ← Đổi email
         </button>
-        <button type="button" disabled={cooldown > 0 || busy} onClick={() => void send()} className="font-semibold text-rose disabled:text-ink-3">
+        <button type="button" disabled={cooldown > 0 || busy} onClick={() => void login.send()} className="font-semibold text-rose disabled:text-ink-3">
           {cooldown > 0 ? `Gửi lại sau ${cooldown}s` : 'Gửi lại mã'}
         </button>
       </div>

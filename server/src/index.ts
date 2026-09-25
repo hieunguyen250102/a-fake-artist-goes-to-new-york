@@ -10,21 +10,22 @@ import cors from 'cors';
 import { Server, type Socket } from 'socket.io';
 
 import { Room } from './room';
-import { requestCode, verifyCode, verifyToken, type User, hostingIsRestricted } from './auth';
+import { authError, authHandler, originPolicy, socketAuth } from 'oink-kit/server';
+import { auth, type User } from './auth';
 import { AVATAR_COUNT, MAX_PLAYERS } from '../../shared/engine';
 import type { SetupInput, Settings } from '../../shared/types';
 
 const PORT = Number(process.env.PORT) || 4000;
-const ORIGINS = (process.env.CLIENT_ORIGIN ?? '*')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+/** CLIENT_ORIGIN: comma list, `*` wildcards allowed (https://game-*.vercel.app); empty = any. */
+const origins = originPolicy(process.env.CLIENT_ORIGIN);
 
 const app = express();
 // Render (and most hosts) sit behind a proxy; the rate limits need the real client IP.
 app.set('trust proxy', 1);
-app.use(cors({ origin: ORIGINS.includes('*') ? true : ORIGINS }));
+app.use(cors({ origin: origins.corsOrigin }));
 app.use(express.json({ limit: '4kb' }));
+// POST /auth/request {email}, POST /auth/verify {email, code, challenge}
+app.use(authHandler(auth));
 
 const rooms = new Map<string, Room>();
 
@@ -34,26 +35,16 @@ app.get('/health', (_req, res) => {
     rooms: rooms.size,
     sockets: io.engine.clientsCount,
     // false means HOST_EMAILS is unset and *anyone* who logs in can open a table
-    hostRestricted: hostingIsRestricted(),
+    hostRestricted: auth.hostingIsRestricted(),
+    // what CLIENT_ORIGIN resolved to, so a CORS mismatch can be spotted from outside
+    allowedOrigins: origins.origins,
     uptime: process.uptime(),
   });
 });
 
-/* ------------------------------------------------------------------ auth */
-
-app.post('/auth/request', async (req, res) => {
-  const result = await requestCode(req.body?.email, req.ip ?? 'unknown');
-  res.status(result.ok ? 200 : 400).json(result);
-});
-
-app.post('/auth/verify', (req, res) => {
-  const result = verifyCode(req.body?.email, req.body?.code, req.body?.challenge);
-  res.status(result.ok ? 200 : 400).json(result);
-});
-
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: ORIGINS.includes('*') ? true : ORIGINS, methods: ['GET', 'POST'] },
+  cors: { origin: origins.corsOrigin, methods: ['GET', 'POST'] },
   pingInterval: 20000,
   pingTimeout: 25000,
   // a long marker line arrives in small batches; nothing legitimate is bigger
@@ -128,12 +119,7 @@ setInterval(
 type Ack<T> = (res: T) => void;
 
 /** Anyone may connect, but only a signed-in socket gets a seat. */
-io.use((socket, next) => {
-  socket.data.user = verifyToken(socket.handshake.auth?.token);
-  next();
-});
-
-const NEED_LOGIN = 'Bạn cần đăng nhập trước';
+io.use(socketAuth(auth));
 
 io.on('connection', (socket: Socket) => {
   const user: User | null = socket.data.user;
@@ -170,8 +156,8 @@ io.on('connection', (socket: Socket) => {
   };
 
   socket.on('room:create', ({ name, avatar }: { name: string; avatar: number }, ack?: Ack<unknown>) => {
-    if (!user) return ack?.({ error: NEED_LOGIN });
-    if (!user.canHost) return ack?.({ error: 'Tài khoản này chỉ được vào bàn, không được tạo bàn' });
+    const denied = authError(user, { host: true });
+    if (denied || !user) return ack?.({ error: denied });
     const code = newCode();
     const room = new Room(code);
     rooms.set(code, room);
@@ -183,7 +169,8 @@ io.on('connection', (socket: Socket) => {
   socket.on(
     'room:join',
     ({ roomCode, name, avatar }: { roomCode: string; name: string; avatar: number }, ack?: Ack<unknown>) => {
-      if (!user) return ack?.({ error: NEED_LOGIN });
+      const denied = authError(user);
+      if (denied || !user) return ack?.({ error: denied });
       const code = (typeof roomCode === 'string' ? roomCode : '').toUpperCase().trim();
       const room = rooms.get(code);
       if (!room) return ack?.({ error: 'Không tìm thấy phòng' });
