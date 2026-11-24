@@ -203,6 +203,14 @@ body {
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06);
   overflow: hidden;
 }
+
+/* while it's your turn: no long-press callout, selection or page bounce */
+.pad-drawing {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  overscroll-behavior: contain;
+}
 /* markers overlap the way ink does */
 .ink-line {
   mix-blend-mode: multiply;

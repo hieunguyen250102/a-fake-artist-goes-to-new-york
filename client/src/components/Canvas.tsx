@@ -5,7 +5,7 @@
  * where it can replay the painting line by line.
  */
 
-import { memo, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { CANVAS_H, CANVAS_W } from '@shared/engine';
 import type { Stroke } from '@shared/types';
@@ -90,7 +90,27 @@ interface Props {
 
 export function Canvas({ strokes, live, showPen, input, replayKey, plate, className = '', emptyHint }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
-  const drawing = useRef(false);
+  const paperRef = useRef<HTMLDivElement>(null);
+  /** the finger/pen drawing the line; any other pointer is ignored */
+  const activePointer = useRef<number | null>(null);
+  const canDraw = !!input;
+
+  // iOS Safari doesn't reliably honour `touch-action` on an <svg>, so a drag
+  // on the pad also pans the page — which then fires `pointercancel` and cuts
+  // the line short. Swallowing the touches natively (non-passive) stops both.
+  useEffect(() => {
+    const el = paperRef.current;
+    if (!el || !canDraw) return;
+    const stop = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+    };
+    el.addEventListener('touchstart', stop, { passive: false });
+    el.addEventListener('touchmove', stop, { passive: false });
+    return () => {
+      el.removeEventListener('touchstart', stop);
+      el.removeEventListener('touchmove', stop);
+    };
+  }, [canDraw]);
 
   /** Screen → canvas units, clamped to the paper. */
   const toCanvas = (e: { clientX: number; clientY: number }): [number, number] => {
@@ -101,21 +121,26 @@ export function Canvas({ strokes, live, showPen, input, replayKey, plate, classN
   };
 
   const down = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (!input || e.button > 0) return;
+    if (!input || e.button > 0 || activePointer.current !== null) return;
     e.preventDefault();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    drawing.current = true;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* capture is a nicety; drawing works without it */
+    }
+    activePointer.current = e.pointerId;
     input.onBegin(...toCanvas(e));
   };
   const move = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (!input || !drawing.current) return;
+    if (!input || activePointer.current !== e.pointerId) return;
+    e.preventDefault();
     // coalesced events give smooth curves on fast strokes
     const events = e.nativeEvent.getCoalescedEvents?.() ?? [];
     for (const ev of events.length ? events : [e.nativeEvent]) input.onMove(...toCanvas(ev));
   };
-  const up = () => {
-    if (!drawing.current) return;
-    drawing.current = false;
+  const up = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (activePointer.current !== e.pointerId) return;
+    activePointer.current = null;
     input?.onEnd();
   };
 
@@ -126,7 +151,11 @@ export function Canvas({ strokes, live, showPen, input, replayKey, plate, classN
 
   return (
     <div className={`pad ${className}`}>
-      <div className="pad-paper">
+      <div
+        ref={paperRef}
+        className={`pad-paper ${input ? 'pad-drawing' : ''}`}
+        style={{ touchAction: input ? 'none' : 'auto' }}
+      >
         <svg
           ref={svgRef}
           viewBox={`0 0 ${CANVAS_W} ${CANVAS_H}`}

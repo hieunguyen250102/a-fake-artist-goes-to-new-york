@@ -54,6 +54,11 @@ export function GameScreen({ state, priv, youId, remoteLive, chat, muted, send, 
   const mineRef = useRef<number[] | null>(null);
   /** points drawn but not yet sent */
   const pending = useRef<number[]>([]);
+  /** a queued repaint of your line */
+  const frame = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (frame.current !== null) cancelAnimationFrame(frame.current);
+  }, []);
   const turnKey = `${state.round}:${state.phase}:${state.turnIndex}`;
 
   // A new turn starts clean — unless a reload caught us mid-line, then pick it back up.
@@ -96,9 +101,18 @@ export function GameScreen({ state, priv, youId, remoteLive, chat, muted, send, 
             const pt = [Math.round(x), Math.round(y)];
             cur.push(...pt);
             pending.current.push(...pt);
-            setMine(cur.slice());
+            // one render per frame, not per point — phones send a lot of points
+            if (frame.current === null) {
+              frame.current = requestAnimationFrame(() => {
+                frame.current = null;
+                if (mineRef.current) setMine(mineRef.current.slice());
+              });
+            }
           },
           onEnd: () => {
+            if (frame.current !== null) cancelAnimationFrame(frame.current);
+            frame.current = null;
+            if (mineRef.current) setMine(mineRef.current.slice());
             flush();
             send('draw:end');
             setMineDone(true);
